@@ -154,6 +154,10 @@ class ProviderRegistry(
     ): Pair<List<ProviderSearchResult>, Map<ProviderInstanceId, String?>> = supervisorScope {
         val results = providersById.values.map { provider ->
             async {
+                // Don't issue a request a provider already told us it cannot serve.
+                if (!provider.capabilities.catalog) {
+                    return@async ProviderSearchResult(provider.instanceId, ProviderResult.Failure(ProviderFailure.Unsupported("catalog")))
+                }
                 val result = try {
                     semaphore.withPermit {
                         withTimeout(timeoutMs) {

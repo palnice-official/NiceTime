@@ -56,6 +56,7 @@ import app.nicetime.android.core.media.DownloadRuntime
 import app.nicetime.android.core.media.DownloadSnapshot
 import app.nicetime.android.core.media.NiceTimePlaybackService
 import app.nicetime.android.core.media.PlaybackCommands
+import app.nicetime.android.core.media.PlaybackError
 import app.nicetime.android.core.model.*
 import app.nicetime.android.ui.theme.NiceTimeTheme
 import kotlinx.coroutines.delay
@@ -185,12 +186,19 @@ fun NiceTimeApp(
             }
             composable(MainTab.DOWNLOADS.route) {
                 DownloadsScreen(downloads, context, onPlay = { snapshot ->
-                    if (DownloadRuntime.isOfflineReady(context, snapshot.id)) {
-                        player?.let { PlaybackCommands.playOffline(it, snapshot.id) }
-                        activeHistory = null
-                        nowPlaying = DisplayTitle(snapshot.id, snapshot.title, 0, "Offline", "", Color(0xFF315B75), "")
-                        showPlayer = true
-                    } else { actionError = "Download is incomplete. Remove and download again." }
+                    if (!DownloadRuntime.isOfflineReady(context, snapshot.id)) {
+                        actionError = "Download is incomplete. Remove and download again."
+                    } else {
+                        val controller = player
+                        if (controller == null) { actionError = "The player is still starting. Try again in a moment."; return@DownloadsScreen }
+                        scope.launch {
+                            val reason = PlaybackCommands.playOffline(controller, snapshot.id)
+                            if (reason != null) { actionError = reason; return@launch }
+                            activeHistory = null
+                            nowPlaying = DisplayTitle(snapshot.id, snapshot.title, 0, "Offline", "", Color(0xFF315B75), "")
+                            showPlayer = true
+                        }
+                    }
                 }, onError = { actionError = it })
             }
             composable(MainTab.YOU.route) {
@@ -216,19 +224,31 @@ fun NiceTimeApp(
                     })
             }
             composable("provider_detail/{titleName}/{sourceName}") { backStackEntry ->
-                val titleName = java.net.URLDecoder.decode(backStackEntry.arguments?.getString("titleName") ?: "", Charsets.UTF_8)
-                val sourceName = java.net.URLDecoder.decode(backStackEntry.arguments?.getString("sourceName") ?: "", Charsets.UTF_8)
+                // URLDecoder.decode(String, Charset) is API 33+, and minSdk is 26 — the
+                // Charset overload would crash on Android 8-12. Use the UTF-8 String overload.
+                val titleName = Uri.decode(backStackEntry.arguments?.getString("titleName") ?: "")
+                val sourceName = Uri.decode(backStackEntry.arguments?.getString("sourceName") ?: "")
                 val provider = nativeProviders.find { it.second == sourceName }?.first
                 if (provider != null) {
                     ProviderDetailsScreen(titleName = titleName, sourceName = sourceName, provider = provider, onBack = { navController.popBackStack() },
                         onPlay = { stream ->
+                            val controller = player
+                            if (controller == null) { actionError = "The player is still starting. Try again in a moment."; return@ProviderDetailsScreen }
                             val title = DisplayTitle(stream.release.episode.media.providerMediaId, titleName, 0, "Movie", "From $sourceName", Color(0xFF315B75), stream.uri)
                             val identity = stream.release.episode
                             val previous = watchProgress.find { it.providerInstanceId == identity.media.provider.toString() && it.mediaId == identity.media.providerMediaId && it.episodeId == identity.providerEpisodeId }
-                            player?.let { PlaybackCommands.play(it, stream, previous?.positionMs ?: 0) }
-                            activeHistory = WatchProgressEntity(identity.media.provider.toString(), identity.media.providerMediaId, identity.providerEpisodeId, titleName, previous?.positionMs ?: 0, null, System.currentTimeMillis())
-                            nowPlaying = title; showPlayer = true
-                            if (settings.historyEnabled) scope.launch { historyRepo.saveProgress(WatchProgressEntity(identity.media.provider.toString(), identity.media.providerMediaId, identity.providerEpisodeId, titleName, previous?.positionMs ?: 0L, null, System.currentTimeMillis())) }
+                            val positionMs = previous?.positionMs ?: 0
+                            scope.launch {
+                                // The service can refuse a stream (bad URL, out-of-scope host);
+                                // show why instead of pretending playback started.
+                                val reason = PlaybackCommands.play(controller, stream, positionMs)
+                                if (reason != null) { actionError = reason; return@launch }
+                                val progress = WatchProgressEntity(identity.media.provider.toString(), identity.media.providerMediaId, identity.providerEpisodeId, titleName, positionMs, null, System.currentTimeMillis())
+                                activeHistory = progress
+                                nowPlaying = title
+                                showPlayer = true
+                                if (settings.historyEnabled) historyRepo.saveProgress(progress)
+                            }
                         },
                         onDownload = { stream -> scope.launch { try { DownloadRuntime.enqueue(context, stream, titleName, settings.wifiOnlyDownloads) } catch (_: Exception) { actionError = "Download could not be queued." } } })
                 }
@@ -304,7 +324,18 @@ fun ProviderDetailsScreen(titleName: String, sourceName: String, provider: Conte
         releases = emptyList(); val chosen = selectedEpisode ?: return@LaunchedEffect
         loading = true; error = null
         when (val streams = provider.streams(chosen)) {
-            is ProviderResult.Ok -> { releases = streams.value.filter { it.ref.episode == chosen }; if (releases.isEmpty()) error = "No supported releases" }
+            is ProviderResult.Ok -> {
+                // Match on the identity that actually matters (media + season/episode) rather than
+                // full EpisodeRef equality, so a provider is free to mint its own episode ids.
+                val sameEpisode = streams.value.filter {
+                    it.ref.episode.media == chosen.media &&
+                        (chosen.season == null || (it.ref.episode.season == chosen.season && it.ref.episode.episode == chosen.episode))
+                }
+                // Only ever offer candidates this provider says it can resolve and deliver.
+                releases = (if (sameEpisode.isNotEmpty()) sameEpisode else streams.value)
+                    .sortedByDescending { it.resolutionHeight ?: 0 }
+                error = if (releases.isEmpty()) "No playable releases were found for this title." else null
+            }
             is ProviderResult.Failure -> error = streams.failure.message
         }
         loading = false
@@ -394,7 +425,7 @@ private fun HomeScreen(watchProgress: List<WatchProgressEntity>, sources: List<S
         sources.filter { it.enabled && it.displayName in selectedProviders }.forEach { source -> when (val created = providerFactory.create(source)) { is ProviderResult.Ok -> providers += created.value to source.displayName; is ProviderResult.Failure -> {} } }
         val registry = ProviderRegistry(providers.map { it.first }); val names = providers.associate { it.first.instanceId to it.second }
         val results = registry.catalogAll(); val errors = mutableListOf<String>()
-        providerItems = results.flatMap { result -> when (val value = result.result) { is ProviderResult.Ok -> value.value.items.mapNotNull { item -> registry.provider(result.provider)?.let { ProviderTitle(item, it, names[result.provider] ?: "Addon") } }; is ProviderResult.Failure -> { errors += "${names[result.provider] ?: "Source"}: ${value.failure.message}"; emptyList() } } }.distinctBy { it.summary.ref }.take(20)
+        providerItems = results.flatMap { result -> when (val value = result.result) { is ProviderResult.Ok -> value.value.items.mapNotNull { item -> registry.provider(result.provider)?.let { ProviderTitle(item, it, names[result.provider] ?: "Addon") } }; is ProviderResult.Failure -> { if (value.failure !is ProviderFailure.Unsupported) errors += "${names[result.provider] ?: "Source"}: ${value.failure.message}"; emptyList() } } }.distinctBy { it.summary.ref }.take(20)
         providerError = errors.joinToString("\n").ifBlank { null }; loading = false
     }
     LazyColumn(modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 24.dp)) {
@@ -555,7 +586,7 @@ private fun SettingsScreen(settings: AppSettings, repository: SettingsRepository
 @Composable
 private fun PlayerDialog(player: Player, title: String, onDismiss: () -> Unit) {
     var isFullscreen by remember { mutableStateOf(false) }; var playbackError by remember { mutableStateOf<String?>(null) }; var playing by remember { mutableStateOf(player.isPlaying) }
-    DisposableEffect(player) { val listener = object : Player.Listener { override fun onIsPlayingChanged(isPlaying: Boolean) { playing = isPlaying }; override fun onPlayerError(error: androidx.media3.common.PlaybackException) { playbackError = "Playback failed. Retry or choose another source." } }; player.addListener(listener); onDispose { player.removeListener(listener) } }
+    DisposableEffect(player) { val listener = object : Player.Listener { override fun onIsPlayingChanged(isPlaying: Boolean) { playing = isPlaying }; override fun onPlayerError(error: androidx.media3.common.PlaybackException) { playbackError = PlaybackError.describe(error, player.currentMediaItem?.localConfiguration?.uri?.toString().orEmpty()) } }; player.addListener(listener); onDispose { player.removeListener(listener) } }
     androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss, properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = !isFullscreen)) {
         Card(Modifier.fillMaxWidth()) { Column {
             AndroidView(factory = { viewContext -> PlayerView(viewContext).apply { this.player = player; useController = true; setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING) } }, update = { it.player = player }, modifier = Modifier.fillMaxWidth().aspectRatio(16f / 9f))

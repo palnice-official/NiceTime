@@ -14,10 +14,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 
 internal object MovieBoxCrypto {
     private const val SECRET = "76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O"
@@ -70,7 +67,7 @@ class MovieBoxProvider(
     private val deviceId: String = java.util.UUID.randomUUID().toString().replace("-", "").take(32),
     private val spoofedIp: String = "49.36.10.10",
 ) : ContentProvider {
-    override val capabilities = ProviderCapabilities(search = true, pagination = true, streamResolution = true, downloadable = true, externalSubtitles = true, supportedTypes = setOf(MediaType.MOVIE, MediaType.SERIES))
+    override val capabilities = ProviderCapabilities(catalog = true, search = true, pagination = true, streamResolution = true, downloadable = true, supportedTypes = setOf(MediaType.MOVIE, MediaType.SERIES))
     private val json = Json { ignoreUnknownKeys = true }
     private val loginMutex = Mutex()
     @Volatile private var session: MovieBoxSession? = null
@@ -185,6 +182,7 @@ class MovieBoxProvider(
 
     private suspend fun rawCall(method: String, path: String, body: String?, token: String?): ProviderResult<JsonObject> = withContext(Dispatchers.IO) {
         var last: ProviderFailure = ProviderFailure.SourceUnavailable("All MovieBox hosts failed")
+        var authFailures = 0
         for (offset in hosts.indices) {
             val index = (activeHost + offset) % hosts.size
             val url = hosts[index].trimEnd('/') + path
@@ -208,7 +206,12 @@ class MovieBoxProvider(
                     conn.outputStream.use { it.write((body ?: "{}").toByteArray(Charsets.UTF_8)) }
                 }
                 val code = conn.responseCode
-                if (code == 401 || code == 403) { conn.disconnect(); return@withContext ProviderResult.Failure(ProviderFailure.AuthExpired()) }
+                if (code == 401 || code == 403) {
+                    // A single geo-blocked or rate-limited host must not condemn the other six.
+                    // Record it and keep trying; only report expired credentials if every host refused.
+                    conn.errorStream?.use { it.readAtMost(1024) }
+                    conn.disconnect(); authFailures++; last = ProviderFailure.AuthExpired(); continue
+                }
                 if (code == 429) { last = ProviderFailure.RateLimited(conn.getHeaderField("Retry-After")?.toLongOrNull()?.times(1000)); conn.disconnect(); continue }
                 if (code !in 200..299) {
                     conn.errorStream?.use { it.readAtMost(1024) }
@@ -224,7 +227,7 @@ class MovieBoxProvider(
             catch (e: java.io.IOException) { last = ProviderFailure.NetworkUnavailable() }
             catch (e: Exception) { last = ProviderFailure.ParseFailure() }
         }
-        ProviderResult.Failure(last)
+        ProviderResult.Failure(if (authFailures >= hosts.size) ProviderFailure.AuthExpired() else last)
     }
 
     private fun summary(value: JsonElement): MediaSummary? {

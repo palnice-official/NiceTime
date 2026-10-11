@@ -1,6 +1,7 @@
 package app.nicetime.android.core.data
 
 import app.nicetime.android.core.model.*
+import java.io.IOException
 import java.net.Proxy
 import java.net.URI
 import java.util.concurrent.ConcurrentHashMap
@@ -22,6 +23,7 @@ class FourKHDHubProvider(
 ) : ContentProvider {
 
     override val capabilities = ProviderCapabilities(
+        catalog = true,
         search = true,
         streamResolution = true,
         downloadable = true,
@@ -30,21 +32,31 @@ class FourKHDHubProvider(
 
     private val resolved = ConcurrentHashMap<String, ResolvedStream>()
 
+    /** Latest uploads. Used to populate Home so discovery is real content, not a hardcoded list. */
     override suspend fun catalog(request: CatalogRequest): ProviderResult<Page<MediaSummary>> =
-        ProviderResult.Failure(ProviderFailure.Unsupported("catalog"))
+        withContext(Dispatchers.IO) {
+            try {
+                if (request.page > 1) return@withContext ProviderResult.Ok(Page(emptyList()))
+                val items = parseSearch(fetchText(baseUrl))
+                // An empty page is a legitimate outcome (markup drift or rate limit), not a
+                // failure that should surface as a red error on Home.
+                ProviderResult.Ok(Page(items, null))
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                ProviderResult.Failure(failureFor(e))
+            }
+        }
 
     override suspend fun search(request: SearchRequest): ProviderResult<Page<MediaSummary>> {
         if (request.query.isBlank()) return ProviderResult.Ok(Page(emptyList()))
         return withContext(Dispatchers.IO) {
             try {
-                val url = "$baseUrl?s=${request.query}"
-                val html = fetchText(url) ?: return@withContext ProviderResult.Failure(ProviderFailure.NetworkUnavailable())
-                val items = parseSearch(html)
-                ProviderResult.Ok(Page(items))
+                ProviderResult.Ok(Page(parseSearch(fetchText("$baseUrl?s=${request.query}"))))
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (e: Exception) {
-                ProviderResult.Failure(ProviderFailure.ParseFailure(e.message ?: "Search failed"))
+                ProviderResult.Failure(failureFor(e))
             }
         }
     }
@@ -54,13 +66,11 @@ class FourKHDHubProvider(
         return withContext(Dispatchers.IO) {
             try {
                 val url = providerUrl(ref.providerMediaId) ?: return@withContext ProviderResult.Failure(ProviderFailure.NotFound())
-                val html = fetchText(url) ?: return@withContext ProviderResult.Failure(ProviderFailure.NetworkUnavailable())
-                val details = parseDetails(ref, html)
-                ProviderResult.Ok(details)
+                ProviderResult.Ok(parseDetails(ref, fetchText(url)))
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (e: Exception) {
-                ProviderResult.Failure(ProviderFailure.ParseFailure(e.message ?: "Details failed"))
+                ProviderResult.Failure(failureFor(e))
             }
         }
     }
@@ -70,34 +80,78 @@ class FourKHDHubProvider(
         return withContext(Dispatchers.IO) {
             try {
                 val url = providerUrl(ref.media.providerMediaId) ?: return@withContext ProviderResult.Failure(ProviderFailure.NotFound())
-                val html = fetchText(url) ?: return@withContext ProviderResult.Failure(ProviderFailure.NetworkUnavailable())
-                val releases = parseReleases(html, ref.season ?: 0, ref.episode ?: 0)
-                ProviderResult.Ok(releases)
+                ProviderResult.Ok(parseReleases(fetchText(url), ref))
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (e: Exception) {
-                ProviderResult.Failure(ProviderFailure.ParseFailure(e.message ?: "Streams failed"))
+                ProviderResult.Failure(failureFor(e))
             }
         }
     }
 
+    /**
+     * Resolves a release to a playable URL. Always re-reads the source page instead of trusting a
+     * previously resolved URL: these mirrors hand out short-lived links, and a cached one is the
+     * classic way an app keeps failing long after the app itself is fine.
+     */
     override suspend fun resolve(ref: ReleaseRef, purpose: ResolvePurpose): ProviderResult<ResolvedStream> {
-        val cached = resolved[ref.providerReleaseId]
-        if (cached != null) return ProviderResult.Ok(cached)
-        return ProviderResult.Failure(ProviderFailure.NotFound("Release must be refreshed"))
+        resolved[ref.providerReleaseId]?.let { cached ->
+            if (!isStale(cached)) return ProviderResult.Ok(cached)
+        }
+        return withContext(Dispatchers.IO) {
+            try {
+                val mediaId = ref.episode.media.providerMediaId
+                val url = providerUrl(mediaId) ?: return@withContext ProviderResult.Failure(ProviderFailure.NotFound())
+                val mirrors = mirrorsFor(fetchText(url), ref)
+                if (mirrors.isEmpty()) {
+                    return@withContext ProviderResult.Failure(ProviderFailure.NotFound("This release is no longer published. Choose another."))
+                }
+                val failures = mutableListOf<String>()
+                for ((mirrorUrl, _) in mirrors) {
+                    when (val direct = resolveMirror(mirrorUrl)) {
+                        is ProviderResult.Ok -> {
+                            val stream = ResolvedStream(
+                                release = ref,
+                                uri = direct.value,
+                                mimeType = mimeTypeFor(direct.value),
+                                requestHeaders = mapOf("User-Agent" to BROWSER_UA),
+                                allowedHosts = setOfNotNull(runCatching { URI(direct.value).host }.getOrNull()),
+                                sourceLabel = "4KHDHub",
+                            )
+                            resolved[ref.providerReleaseId] = stream
+                            return@withContext ProviderResult.Ok(stream)
+                        }
+                        is ProviderResult.Failure -> failures += direct.failure.message
+                    }
+                }
+                ProviderResult.Failure(ProviderFailure.SourceUnavailable("No 4KHDHub mirror responded: ${failures.joinToString("; ")}"))
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                ProviderResult.Failure(failureFor(e))
+            }
+        }
     }
 
-    fun registerResolved(ref: ReleaseRef, stream: ResolvedStream) {
-        resolved[ref.providerReleaseId] = stream
+    /** Short-lived mirror links are re-resolved once they are more than this old. */
+    private fun isStale(stream: ResolvedStream): Boolean {
+        val expires = stream.expiresAtEpochMs ?: return false
+        return System.currentTimeMillis() >= expires
     }
 
-    private fun fetchText(url: String): String? = try {
+    private fun mimeTypeFor(url: String): String? = when {
+        url.substringBefore('?').endsWith(".mpd", true) -> "application/dash+xml"
+        url.substringBefore('?').endsWith(".m3u8", true) -> "application/x-mpegURL"
+        else -> null
+    }
+
+    /** Fetches a page, throwing a typed error so callers can classify it. */
+    private fun fetchText(url: String): String =
         http.newCall(Request.Builder().url(url).header("User-Agent", BROWSER_UA).get().build())
             .execute().use { response ->
-                if (!response.isSuccessful) return@use null
-                response.body?.byteStream()?.use { it.readAtMost(MAX_RESPONSE) }?.toString(Charsets.UTF_8)
+                if (!response.isSuccessful) throw HttpStatusException(response.code, url)
+                response.body?.byteStream()?.use { it.readAtMost(MAX_RESPONSE) }?.toString(Charsets.UTF_8).orEmpty()
             }
-    } catch (_: Exception) { null }
 
     private fun providerUrl(id: String): String? {
         val clean = id.trimStart('/')
@@ -105,6 +159,23 @@ class FourKHDHubProvider(
         val host = URI(baseUrl).host ?: return null
         if (URI(url).host != host) return null
         return url
+    }
+
+    private class HttpStatusException(val code: Int, url: String) : IOException("HTTP $code for $url")
+
+    /** Maps a thrown error to the failure the UI can explain. Order matters: subclasses first. */
+    private fun failureFor(error: Throwable): ProviderFailure = when (error) {
+        is HttpStatusException -> when (error.code) {
+            401, 403 -> ProviderFailure.AuthExpired("4KHDHub refused the request (HTTP ${error.code}). Check the source in You.")
+            404 -> ProviderFailure.NotFound("That title is no longer on 4KHDHub.")
+            429 -> ProviderFailure.RateLimited(null)
+            in 500..599 -> ProviderFailure.SourceUnavailable("4KHDHub is having trouble (HTTP ${error.code})")
+            else -> ProviderFailure.SourceUnavailable("4KHDHub returned HTTP ${error.code}")
+        }
+        is java.net.SocketTimeoutException -> ProviderFailure.Timeout()
+        is java.net.UnknownHostException -> ProviderFailure.NetworkUnavailable("4KHDHub could not be reached")
+        is IOException -> ProviderFailure.NetworkUnavailable()
+        else -> ProviderFailure.ParseFailure(error.message ?: "Could not read the 4KHDHub response")
     }
 
     // --- HTML parsing (ported from Rust parser.rs) ---
@@ -174,10 +245,11 @@ class FourKHDHubProvider(
         val prints = metadata["Prints:"] ?: metadata["Print:"]
         val audios = metadata["Audios:"]
 
-        val seasons = parseSeasons(html)
+        val detailsRef = ref.copy(type = type)
+        val seasons = parseSeasons(html, detailsRef)
 
         return MediaDetails(
-            ref = ref.copy(type = type),
+            ref = detailsRef,
             title = title,
             year = year?.toIntOrNull(),
             synopsis = description,
@@ -186,18 +258,24 @@ class FourKHDHubProvider(
         )
     }
 
-    private fun parseReleases(html: String, season: Int, episode: Int): List<Release> {
+    /**
+     * Builds the playable candidates for one episode, carrying the **caller's** media identity
+     * through. Releases used to invent a fresh identity per parse, so the details screen could
+     * never match one and always reported "No supported releases".
+     */
+    private fun parseReleases(html: String, ref: EpisodeRef): List<Release> {
+        val series = ref.media.type == MediaType.SERIES
+        val season = ref.season ?: 0
+        val episode = ref.episode ?: 0
+        val titleSelector = if (series) EPISODE_FILE_TITLE_PATTERN else FILE_TITLE_PATTERN
         val releaseMap = mutableMapOf<String, Release>()
-        val itemSelector = if (season > 0) EPISODE_ITEM_PATTERN else DOWNLOAD_ITEM_PATTERN
-        val titleSelector = if (season > 0) EPISODE_FILE_TITLE_PATTERN else FILE_TITLE_PATTERN
 
-        for (itemMatch in itemSelector.findAll(html)) {
-            val itemHtml = itemMatch.groupValues[0]
+        for (itemHtml in itemBlocks(html, series)) {
             val filename = titleSelector.find(itemHtml)?.groupValues?.get(1)?.let { stripTags(it) }?.trim() ?: continue
             if (filename.isBlank() || isArchive(filename)) continue
 
             val parsedEp = parseSeasonEpisode(filename)
-            if (season > 0 && parsedEp != Pair(season, episode)) continue
+            if (series && parsedEp != Pair(season, episode)) continue
 
             val mirrors = parseMirrors(itemHtml)
             if (mirrors.isEmpty()) continue
@@ -205,40 +283,62 @@ class FourKHDHubProvider(
             val sizeText = SIZE_BADGE.findAll(itemHtml).mapNotNull { stripTags(it.groupValues[1]).trim() }
                 .firstOrNull { parseSizeBytes(it) != null }
 
+            // Deterministic and derived from the page, so a release can be re-resolved after
+            // process death instead of depending on an in-memory cache.
             val key = normalizeFilename(filename)
-            val existing = releaseMap[key]
-            if (existing != null) {
-                val merged = existing.ref.copy(providerReleaseId = existing.ref.providerReleaseId)
-                val mergedMirrors = existing.label // keep first label
-                // merge mirrors — dedup by URL
-                releaseMap[key] = existing
-            } else {
-                val releaseId = "$key:${System.nanoTime()}"
-                val epRef = EpisodeRef(
-                    MediaRef(instanceId, releaseId, if (season > 0) MediaType.SERIES else MediaType.MOVIE),
-                    releaseId, parsedEp?.first, parsedEp?.second
-                )
-                val releaseRef = ReleaseRef(epRef, releaseId)
-                val quality = detectQuality(filename)
-                val codec = detectCodec(filename)
-                val label = listOfNotNull(quality, codec).joinToString(" ").ifBlank { "4KHDHub" }
-                val rel = Release(
-                    ref = releaseRef,
+            val releaseId = "${ref.media.providerMediaId}#$key"
+            val quality = detectQuality(filename)
+            val codec = detectCodec(filename)
+            val label = listOfNotNull(quality, codec).joinToString(" ").ifBlank { "4KHDHub" }
+            releaseMap.getOrPut(key) {
+                mirrorUrls[releaseId] = mirrors
+                Release(
+                    ref = ReleaseRef(
+                        EpisodeRef(ref.media, releaseId, parsedEp?.first ?: ref.season, parsedEp?.second ?: ref.episode),
+                        releaseId,
+                    ),
                     label = label,
                     resolutionHeight = quality?.replace("p", "")?.toIntOrNull(),
                     audioLanguage = detectLanguage(filename),
                     sizeBytes = sizeText?.let { parseSizeBytes(it) },
                     downloadable = true,
                 )
-                releaseMap[key] = rel
-                // Store mirror URLs for resolve
-                mirrorUrls[releaseId] = mirrors
             }
         }
         return releaseMap.values.sortedByDescending { it.resolutionHeight ?: 0 }
     }
 
+    /** Finds the mirrors belonging to one release on a freshly fetched page. */
+    private fun mirrorsFor(html: String, ref: ReleaseRef): List<Pair<String, String>> {
+        val series = ref.episode.media.type == MediaType.SERIES
+        val titleSelector = if (series) EPISODE_FILE_TITLE_PATTERN else FILE_TITLE_PATTERN
+        val wanted = ref.providerReleaseId.substringAfter('#', "")
+        if (wanted.isEmpty()) return mirrorUrls[ref.providerReleaseId].orEmpty()
+        for (itemHtml in itemBlocks(html, series)) {
+            val filename = titleSelector.find(itemHtml)?.groupValues?.get(1)?.let { stripTags(it) }?.trim() ?: continue
+            if (normalizeFilename(filename) != wanted) continue
+            val mirrors = parseMirrors(itemHtml)
+            if (mirrors.isNotEmpty()) {
+                mirrorUrls[ref.providerReleaseId] = mirrors
+                return mirrors
+            }
+        }
+        return mirrorUrls[ref.providerReleaseId].orEmpty()
+    }
+
     private val mirrorUrls = ConcurrentHashMap<String, List<Pair<String, String>>>()
+
+    /**
+     * Splits a page into one block per download item. Matching to the next item's opening tag
+     * (instead of a non-greedy `.*?</div>`) is what keeps nested markup from truncating a block
+     * before its mirror links.
+     */
+    private fun itemBlocks(html: String, series: Boolean): List<String> {
+        val startPattern = if (series) EPISODE_ITEM_START_PATTERN else DOWNLOAD_ITEM_START_PATTERN
+        val starts = startPattern.findAll(html).map { it.range.first }.toList()
+        if (starts.isEmpty()) return emptyList()
+        return starts.mapIndexed { index, start -> html.substring(start, starts.getOrNull(index + 1) ?: html.length) }
+    }
 
     private fun parseMirrors(itemHtml: String): List<Pair<String, String>> {
         val mirrors = mutableListOf<Pair<String, String>>()
@@ -252,18 +352,30 @@ class FourKHDHubProvider(
         return mirrors
     }
 
-    private fun parseSeasons(html: String): List<Season> {
-        val seasonMap = mutableMapOf<Int, MutableMap<Int, Unit>>()
-        for (match in EPISODE_ITEM_PATTERN.findAll(html)) {
-            val itemHtml = match.groupValues[0]
+    /**
+     * Builds the selectable entries for the details screen.
+     *
+     * Episodes carry the **real** media id: an empty one made `streams()` re-fetch the site root
+     * and parse the wrong page. The parsed filename is kept as the title, which is what the UI
+     * actually shows next to the episode number.
+     *
+     * A movie page has no episode markup at all, so without a synthetic entry the details screen
+     * offers nothing to select and the release list never loads — a movie would be unplayable.
+     */
+    private fun parseSeasons(html: String, ref: MediaRef): List<Season> {
+        val seasonMap = mutableMapOf<Int, MutableMap<Int, String>>()
+        for (itemHtml in itemBlocks(html, series = true)) {
             val filename = EPISODE_FILE_TITLE_PATTERN.find(itemHtml)?.groupValues?.get(1)?.let { stripTags(it) }?.trim() ?: continue
             val (s, e) = parseSeasonEpisode(filename) ?: continue
-            seasonMap.getOrPut(s) { mutableMapOf() }[e] = Unit
+            seasonMap.getOrPut(s) { mutableMapOf() }[e] = filename
         }
+        if (seasonMap.isEmpty() && ref.type == MediaType.MOVIE) {
+            return listOf(Season("movie", null, listOf(EpisodeSummary(EpisodeRef(ref, ref.providerMediaId, null, null), ref.providerMediaId, null, null))))
+        }
+        val seriesRef = ref.copy(type = MediaType.SERIES)
         return seasonMap.toSortedMap().map { (num, eps) ->
-            Season("season-$num", num, eps.keys.sorted().map { ep ->
-                val epId = "$num:$ep"
-                EpisodeSummary(EpisodeRef(MediaRef(instanceId, "", MediaType.SERIES), epId, num, ep), null, num, ep)
+            Season("season-$num", num, eps.entries.sortedBy { it.key }.map { (ep, filename) ->
+                EpisodeSummary(EpisodeRef(seriesRef, "$num:$ep", num, ep), filename, num, ep)
             })
         }
     }
@@ -357,7 +469,8 @@ class FourKHDHubProvider(
 
     // --- HubCloud resolution (ported from hubcloud.rs) ---
 
-    suspend fun resolveMirror(mirrorUrl: String, label: String): ProviderResult<Pair<String, String>> {
+    /** Resolves one mirror page to a direct, playable URL. */
+    suspend fun resolveMirror(mirrorUrl: String): ProviderResult<String> {
         return withContext(Dispatchers.IO) {
             try {
                 val resolved = when {
@@ -365,19 +478,28 @@ class FourKHDHubProvider(
                     "hubdrive." in mirrorUrl -> resolveHubDrive(mirrorUrl)
                     else -> validatePlaybackUrl(mirrorUrl)
                 }
-                resolved?.let { ProviderResult.Ok(it to label) }
-                    ?: ProviderResult.Failure(ProviderFailure.SourceUnavailable("No playable URL"))
+                resolved?.let { ProviderResult.Ok(it) }
+                    ?: ProviderResult.Failure(ProviderFailure.SourceUnavailable("No playable link on this mirror"))
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (e: Exception) {
-                ProviderResult.Failure(ProviderFailure.SourceUnavailable(e.message ?: "Resolve failed"))
+                ProviderResult.Failure(failureFor(e))
             }
         }
     }
 
+    /** Best-effort fetch for the resolver chain: a dead mirror just means "try the next one". */
+    private fun fetchTextOrNull(url: String): String? = try {
+        fetchText(url)
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        null
+    }
+
     private fun resolveHubCloud(driveUrl: String): String? {
         if (!driveUrl.startsWith("https://") || "hubcloud." !in driveUrl || !driveUrl.contains("/drive/")) return null
-        val html = fetchText(driveUrl) ?: return null
+        val html = fetchTextOrNull(driveUrl) ?: return null
         val resolverUrl = Regex("""href="(https://[^"]*(?:hubcloud|download|btn)[^"]*)"""").findAll(html)
             .map { it.groupValues[1] }
             .firstOrNull { it.startsWith("https://") } ?: return null
@@ -386,7 +508,7 @@ class FourKHDHubProvider(
 
     private fun resolveHubDrive(driveUrl: String): String? {
         if (!driveUrl.startsWith("https://") || "hubdrive." !in driveUrl) return null
-        val html = fetchText(driveUrl) ?: return null
+        val html = fetchTextOrNull(driveUrl) ?: return null
         val hubcloudUrl = Regex("""href="(https://hubcloud[^"]*)"""").findAll(html)
             .map { it.groupValues[1] }
             .firstOrNull { it.contains("/drive/") } ?: return null
@@ -394,7 +516,7 @@ class FourKHDHubProvider(
     }
 
     private fun resolveResolverPage(resolverUrl: String): String? {
-        val html = fetchText(resolverUrl) ?: return null
+        val html = fetchTextOrNull(resolverUrl) ?: return null
         // Try pixeldrain URLs from script content
         val pixeldrainUrls = mutableListOf<String>()
         for (prefix in listOf("https://pixeldrain.dev/u/", "https://pixeldrain.com/u/", "https://pixeldrain.dev/api/file/", "https://pixeldrain.com/api/file/")) {
@@ -460,10 +582,14 @@ class FourKHDHubProvider(
         private const val BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         private const val MAX_RESPONSE = 5 * 1_048_576
         private val GENRES = setOf("action", "adventure", "animation", "comedy", "crime", "documentary", "drama", "family", "fantasy", "history", "horror", "music", "mystery", "romance", "science fiction", "sci-fi", "thriller", "war", "western")
-        private val EPISODE_ITEM_PATTERN = Regex("""<div[^>]*class="[^"]*episode-download-item[^"]*"[^>]*>([\s\S]*?)</div>""", RegexOption.DOT_MATCHES_ALL)
-        private val DOWNLOAD_ITEM_PATTERN = Regex("""<div[^>]*class="[^"]*download-item[^"]*"[^>]*>([\s\S]*?)</div>""", RegexOption.DOT_MATCHES_ALL)
+        private val EPISODE_ITEM_START_PATTERN = Regex("""<div[^>]*class="[^"]*episode-download-item[^"]*"[^>]*>""")
+        /**
+         * The lookbehind matters: without it `class="episode-download-item"` would also satisfy
+         * the plain `download-item` token and every series block would be parsed twice.
+         */
+        private val DOWNLOAD_ITEM_START_PATTERN = Regex("""<div[^>]*class="[^"]*(?<!episode-)download-item[^"]*"[^>]*>""")
         private val EPISODE_FILE_TITLE_PATTERN = Regex("""<[^>]*class="[^"]*episode-file-title[^"]*"[^>]*>(.*?)</[^>]*>""", RegexOption.DOT_MATCHES_ALL)
-        private val FILE_TITLE_PATTERN = Regex("""<[^>]*class="[^"]*file-title[^"]*"[^>]*>(.*?)</[^>]*>""", RegexOption.DOT_MATCHES_ALL)
+        private val FILE_TITLE_PATTERN = Regex("""<[^>]*class="[^"]*(?<!episode-)file-title[^"]*"[^>]*>(.*?)</[^>]*>""", RegexOption.DOT_MATCHES_ALL)
         private val SIZE_BADGE = Regex("""<[^>]*class="[^"]*(?:badge-size|badge)[^"]*"[^>]*>(.*?)</[^>]*>""", RegexOption.DOT_MATCHES_ALL)
     }
 }
