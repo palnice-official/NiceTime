@@ -39,3 +39,5 @@ Install updates over the existing package with the same signing key. Android may
 For a failed or expired download, remove that entry and resolve/download it again. The implementation intentionally refuses replacing its URL in place without resource identity proof. A missing required offline asset produces a playback failure, with no network fallback. Legacy download entries created by the previous cache-key scheme may need to be downloaded again; they are not silently deleted.
 
 Remaining acceptance includes minimum-API coverage, process/reboot/force-stop recovery, adaptive track/subtitle coverage, source expiry, live independent providers, accessibility, sustained performance and release signing. See `TASKS.md` and the dated evidence ledger.
+
+opencode -s ses_f5b837955ffeCOYvt5ctlFuNp7

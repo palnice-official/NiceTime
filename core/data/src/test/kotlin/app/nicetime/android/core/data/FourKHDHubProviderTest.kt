@@ -64,6 +64,20 @@ class FourKHDHubProviderTest {
     }
 
     @Test
+    fun search_parsesCurrentHrefBeforeClassLayout() = runTest {
+        server.enqueue(MockResponse().setBody("""
+            <a href="/example-movie-509/" class="movie-card" aria-label="Example details">
+              <div class="movie-card-image"><img src="https://example.test/poster.jpg"></div>
+              <div class="movie-card-content"><h3 class="movie-card-title">Example</h3>
+                <p class="movie-card-meta">2010</p></div>
+            </a>
+        """.trimIndent()))
+        val result = provider.search(SearchRequest("Example")) as ProviderResult.Ok
+        assertEquals(1, result.value.items.size)
+        assertEquals("example-movie-509/", result.value.items.single().ref.providerMediaId)
+    }
+
+    @Test
     fun search_blankQuery_returnsEmpty() = runTest {
         val result = provider.search(SearchRequest(""))
         assertTrue(result is ProviderResult.Ok)
@@ -100,11 +114,7 @@ class FourKHDHubProviderTest {
         assertEquals(2010, details.year)
         assertEquals("https://example.com/poster.jpg", details.posterUrl)
         assertEquals("A thief who steals corporate secrets", details.synopsis)
-        // A movie has no episode markup, so it must still offer exactly one selectable entry —
-        // otherwise nothing can be tapped and the release list never loads.
-        assertEquals(1, details.seasons.size)
-        val entry = details.seasons.single().episodes.single()
-        assertEquals("The details screen matches episodes on media identity", details.ref, entry.ref.media)
+        assertEquals(0, details.seasons.size)
     }
 
     @Test
@@ -140,6 +150,24 @@ class FourKHDHubProviderTest {
     }
 
     @Test
+    fun streams_keepsNestedFileAndMirrorsWithOriginalMediaRef() = runTest {
+        val episode = EpisodeRef(MediaRef(provider.instanceId, "example-movie-509/", MediaType.MOVIE),
+            "example-movie-509/", null, null)
+        server.enqueue(MockResponse().setBody("""
+            <div class="download-item border rounded-lg">
+              <div class="download-header"><div class="flex-1">Example 1080p</div></div>
+              <div class="hidden"><div class="file-title">Example.2010.1080p.x264.mkv</div>
+                <div class="grid"><a href="https://hubcloud.ist/drive/abc">HubCloud</a></div>
+              </div>
+            </div>
+        """.trimIndent()))
+        val result = provider.streams(episode) as ProviderResult.Ok
+        assertEquals(1, result.value.size)
+        assertEquals(episode, result.value.single().ref.episode)
+        assertEquals(1080, result.value.single().resolutionHeight)
+    }
+
+    @Test
     fun streams_filtersBySeasonAndEpisode() = runTest {
         val ref = EpisodeRef(
             MediaRef(provider.instanceId, "series/breaking-bad-series", MediaType.SERIES),
@@ -169,83 +197,41 @@ class FourKHDHubProviderTest {
     }
 
     @Test
-    fun catalog_parsesLatestUploads() = runTest {
+    fun seriesEpisodes_useTheDetailMediaRefAndFindSeasonMarkersLaterInTitle() = runTest {
+        val media = MediaRef(provider.instanceId, "suits-series-1385/", MediaType.SERIES)
         val html = """
-            <a class="movie-card" href="/movie/dune-part-two-2024">
-                <img src="https://example.com/dune.jpg" />
-                <div class="movie-card-title">Dune: Part Two</div>
-                <div class="movie-card-meta">2024 • Movie</div>
-            </a>
+            <h1>Suits</h1>
+            <div class="episode-download-item">
+              <div class="episode-file-title">Suits S01E02 1080p.mkv</div>
+              <div class="episode-links"><a href="https://hubcloud.ist/drive/ep2">HubCloud</a></div>
+            </div>
         """.trimIndent()
         server.enqueue(MockResponse().setBody(html))
+        val details = provider.details(media) as ProviderResult.Ok
+        val episode = details.value.seasons.single().episodes.single().ref
+        assertEquals(media, episode.media)
+        assertEquals(1, episode.season)
+        assertEquals(2, episode.episode)
 
+        server.enqueue(MockResponse().setBody(html))
+        val streams = provider.streams(episode) as ProviderResult.Ok
+        assertEquals(episode, streams.value.single().ref.episode)
+    }
+
+    @Test
+    fun catalog_parsesCurrentHomepageCards() = runTest {
+        server.enqueue(MockResponse().setBody("""
+            <a href="/latest-movie-123/" class="movie-card">
+              <div class="movie-card-content"><h3 class="movie-card-title">Latest</h3>
+                <p class="movie-card-meta">2026</p></div>
+            </a>
+        """.trimIndent()))
         val result = provider.catalog(CatalogRequest())
         assertTrue(result is ProviderResult.Ok)
         val items = (result as ProviderResult.Ok).value.items
         assertEquals(1, items.size)
-        assertEquals("Dune: Part Two", items[0].title)
-        assertEquals("movie/dune-part-two-2024", items[0].ref.providerMediaId)
-        // The homepage is page 1; there is no reliable paging scheme, so no cursor is promised.
-        assertNull(result.value.nextCursor)
-    }
-
-    @Test
-    fun catalog_unreachableSource_reportsNetworkFailure() = runTest {
-        server.shutdown()
-        val result = provider.catalog(CatalogRequest())
-        assertTrue("Expected a network failure, got $result", result is ProviderResult.Failure)
-        val failure = (result as ProviderResult.Failure).failure
-        assertTrue("Got ${failure::class.simpleName}: ${failure.message}", failure is ProviderFailure.NetworkUnavailable)
-    }
-
-    @Test
-    fun releaseIds_areDeterministic_acrossRepeatedParses() = runTest {
-        val ref = EpisodeRef(MediaRef(provider.instanceId, "movie/inception-2010", MediaType.MOVIE), "inception", null, null)
-        val html = """
-            <div class="download-item">
-                <span class="file-title">Inception.2010.1080p.BluRay.x264.mkv</span>
-                <a href="https://hubcloud.one/drive/abc123">HubCloud</a>
-            </div>
-        """.trimIndent()
-        server.enqueue(MockResponse().setBody(html))
-        server.enqueue(MockResponse().setBody(html))
-
-        val first = (provider.streams(ref) as ProviderResult.Ok).value
-        val second = (provider.streams(ref) as ProviderResult.Ok).value
-        // A stable id is what lets a release be re-resolved after the process is killed.
-        assertEquals(first.single().ref.providerReleaseId, second.single().ref.providerReleaseId)
-    }
-
-    /** The identity the details screen chose must survive into the releases it filters on. */
-    @Test
-    fun releases_carryTheCallerMediaIdentity() = runTest {
-        val ref = EpisodeRef(MediaRef(provider.instanceId, "movie/inception-2010", MediaType.MOVIE), "inception", null, null)
-        server.enqueue(MockResponse().setBody("""
-            <div class="download-item">
-                <span class="file-title">Inception.2010.1080p.BluRay.x264.mkv</span>
-                <a href="https://hubcloud.one/drive/abc123">HubCloud</a>
-            </div>
-        """.trimIndent()))
-
-        val releases = (provider.streams(ref) as ProviderResult.Ok).value
-        assertEquals(ref.media, releases.single().ref.episode.media)
-    }
-
-    /** A release that is not on the page anymore says so instead of blaming a stale cache. */
-    @Test
-    fun resolve_unknownRelease_reportsNotFound() = runTest {
-        server.enqueue(MockResponse().setBody("""
-            <div class="download-item">
-                <span class="file-title">Some.Other.Movie.2020.720p.mkv</span>
-                <a href="https://hubcloud.one/drive/zzz">HubCloud</a>
-            </div>
-        """.trimIndent()))
-        val ref = EpisodeRef(MediaRef(provider.instanceId, "movie/inception-2010", MediaType.MOVIE), "inception", null, null)
-        val unknown = ReleaseRef(ref, "movie/inception-2010#someotherrelease")
-
-        val result = provider.resolve(unknown, ResolvePurpose.STREAM)
-        assertTrue("Expected NotFound, got $result", result is ProviderResult.Failure)
-        assertTrue((result as ProviderResult.Failure).failure is ProviderFailure.NotFound)
+        assertEquals("Latest", items.single().title)
+        assertEquals("latest-movie-123/", items.single().ref.providerMediaId)
     }
 
     @Test

@@ -1,0 +1,17 @@
+Date: 2026-09-15
+Build: debug APK, Gradle 9.6.0 / AGP 9.4.0 / Kotlin 2.2.10 / KSP 2.3.6 / Room 2.7.2
+Target: NiceTime_API_35 Android emulator (API 35, x86_64)
+
+Command: .\gradlew.bat :core:data:testDebugUnitTest :app:assembleDebug '-Pkotlin.compiler.execution.strategy=in-process'
+Result: BUILD SUCCESSFUL; FourKHDHubProviderTest: 11 tests, 0 failures/errors.
+
+Live UI procedure:
+1. Open Explore and select only 4KHDHub.
+2. Search for Inception. One 4KHDHub result appears with title, year and poster.
+3. Open the result. Details and seven release choices appear.
+4. Press Play on the 1080p H.264 choice. The player opens, renders a video frame and shows Pause.
+5. Install the final APK and reopen Home. The 4KHDHub source chip is selected and Trending shows a live homepage card, "A Great Awakening" (2026), labeled 4KHDHub.
+
+The release mirror returned HTTP 206 and a Matroska content type during a one-byte range probe when the resolver Referer was supplied. No source token, signed media URL or credential is recorded here.
+
+Not exercised: full-length playback, physical-phone playback, offline completion/replay, URL expiry, other codecs, other regions or every mirror. The updated debug APK installed over the existing physical-phone package successfully, preserving app data; the phone locked during the live UI check.
