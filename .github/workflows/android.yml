@@ -11,9 +11,30 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      # `sdkmanager` is not on windows-latest's PATH. Locate it under ANDROID_HOME
+      # instead of assuming, and fail loudly on a bad exit code: PowerShell does not
+      # fail a step on a native command's exit status on its own, so without this the
+      # step could "succeed" while installing nothing.
       - name: Install Android platform
         shell: pwsh
-        run: sdkmanager 'platforms;android-36' 'build-tools;34.0.0'
+        run: |
+          $sdk = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { $env:ANDROID_SDK_ROOT }
+          if (-not $sdk) { throw 'Neither ANDROID_HOME nor ANDROID_SDK_ROOT is set on this runner' }
+          $sdkmanager = Join-Path $sdk 'cmdline-tools\latest\bin\sdkmanager.bat'
+          if (-not (Test-Path $sdkmanager)) {
+            $found = Get-ChildItem (Join-Path $sdk 'cmdline-tools') -Recurse -Filter 'sdkmanager.bat' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $sdkmanager = $found.FullName }
+          }
+          if (-not (Test-Path $sdkmanager)) { throw "sdkmanager not found under $sdk" }
+          Write-Host "Using sdkmanager at $sdkmanager"
+
+          # sdkmanager reports progress on stderr; keep that from failing the step,
+          # but still honour its real exit code below. One 'y' per line: the runner
+          # image pre-accepts most licences, this just makes it explicit.
+          $ErrorActionPreference = 'Continue'
+          1..60 | ForEach-Object { 'y' } | & $sdkmanager --licenses
+          & $sdkmanager 'platforms;android-36' 'build-tools;34.0.0'
+          if ($LASTEXITCODE -ne 0) { throw "sdkmanager exited with code $LASTEXITCODE" }
       - name: Build, unit tests, lint
         shell: pwsh
         run: .\gradlew.bat assembleDebug testDebugUnitTest :core:model:test lintDebug '-Pkotlin.compiler.execution.strategy=in-process'
